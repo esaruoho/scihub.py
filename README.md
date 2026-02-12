@@ -2,105 +2,141 @@ scihub.py
 [![Python](https://img.shields.io/badge/Python-3%2B-blue.svg)](https://www.python.org)
 =========
 
-scihub.py is an unofficial API for Sci-hub. scihub.py can search for papers on Google Scholars and download papers from Sci-hub. It can be imported independently or used from the command-line.
+scihub.py is an unofficial API for Sci-Hub. scihub.py can search for papers on Google Scholar and download papers from Sci-Hub. It can be imported independently or used from the command-line.
 
 If you believe in open access to scientific papers, please donate to Sci-Hub.
 
 Features
 --------
-* Download specific articles directly or via Sci-hub
-* Download a collection of articles by passing in file of article identifiers
-* Search for articles on Google Scholars and download them
+* Download specific articles directly or via Sci-Hub by DOI, PMID, or URL
+* Download a collection of articles by passing in a file of identifiers
+* Search for articles on Google Scholar and download them
+* Automatic mirror rotation with fallback across multiple Sci-Hub mirrors
+* Rate limiting to reduce CAPTCHA triggers during batch downloads
+* Override mirrors with `-m` flag when domains change
 
-**Note**: A known limitation of scihub.py is that captchas show up every now and then, blocking any searches or downloads.
+**Note**: Sci-Hub has not added new papers since 2021 (pending an Indian court case). Papers up through 2021 should be available. CAPTCHAs may still appear after many consecutive downloads — rate limiting helps but cannot eliminate them entirely.
 
 Setup
 -----
-```
+```bash
+python3 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
 ```
 
+### Quick install (shell wrapper)
+
+To use `scihub` as a command from anywhere:
+
+```bash
+# Make the wrapper executable
+chmod +x scihub.sh
+
+# Symlink to somewhere on your PATH
+ln -s /path/to/sci-hub/scihub.sh ~/.local/bin/scihub
+```
+
 Usage
-------
-You can interact with scihub.py from the commandline:
+-----
 
+### Shell wrapper (quickest)
+
+```bash
+# Download by DOI — PDF lands in current directory
+scihub 10.1038/nature12373
+
+# Download by URL
+scihub https://www.nature.com/articles/nature12373
+
+# Batch download from a file of DOIs (one per line)
+scihub -f dois.txt
+
+# Search Google Scholar
+scihub -s "CRISPR gene editing"
+
+# Search and download top 5 results
+scihub -sd "quantum entanglement" -l 5
+
+# Save to a specific directory
+scihub 10.1038/nature12373 -o ~/papers/
+
+# Use a specific mirror (can be repeated)
+scihub 10.1038/nature12373 -m https://sci-hub.ru
 ```
-usage: scihub.py [-h] [-d (DOI|PMID|URL)] [-f path] [-s query] [-sd query]
-                 [-l N] [-o path] [-v]
 
-SciHub - To remove all barriers in the way of science.
+### Command-line (without wrapper)
 
-optional arguments:
-  -h, --help            show this help message and exit
-  -d (DOI|PMID|URL), --download (DOI|PMID|URL)
-                        tries to find and download the paper
-  -f path, --file path  pass file with list of identifiers and download each
-  -s query, --search query
-                        search Google Scholars
-  -sd query, --search_download query
-                        search Google Scholars and download if possible
-  -l N, --limit N       the number of search results to limit to
-  -o path, --output path
-                        directory to store papers
-  -v, --verbose         increase output verbosity
-  -p, --proxy           set proxy
+```bash
+source venv/bin/activate
+
+python scihub/scihub.py [-h] [-d (DOI|PMID|URL)] [-f path] [-s query]
+                        [-sd query] [-l N] [-o path] [-v] [-p PROXY] [-m URL]
 ```
 
-You can also import scihub. The following examples below demonstrate all the features.
+| Flag | Description |
+|------|-------------|
+| `-d`, `--download` | Download a single paper by DOI, PMID, or URL |
+| `-f`, `--file` | Path to a file of identifiers (one per line) |
+| `-s`, `--search` | Search Google Scholar and print results |
+| `-sd`, `--search_download` | Search Google Scholar and download results |
+| `-l`, `--limit` | Number of search results (default: 10) |
+| `-o`, `--output` | Output directory for downloaded papers |
+| `-v`, `--verbose` | Enable verbose/debug logging |
+| `-p`, `--proxy` | Proxy URL (e.g. `socks5://user:pass@host:port`) |
+| `-m`, `--mirror` | Override Sci-Hub mirror URL (can be repeated) |
 
-### fetch
+### Python API
 
-```
+#### fetch
+
+```python
 from scihub import SciHub
 
 sh = SciHub()
 
 # fetch specific article (don't download to disk)
-# this will return a dictionary in the form 
-# {'pdf': PDF_DATA,
-#  'url': SOURCE_URL,
-#  'name': UNIQUE_GENERATED NAME
-# }
-result = sh.fetch('http://ieeexplore.ieee.org/xpl/login.jsp?tp=&arnumber=1648853')
+# returns {'pdf': PDF_DATA, 'url': SOURCE_URL, 'name': GENERATED_NAME}
+result = sh.fetch('10.1038/nature12373')
 ```
 
-### download
+#### download
 
-```
+```python
 from scihub import SciHub
 
 sh = SciHub()
 
-# exactly the same thing as fetch except downloads the articles to disk
-# if no path given, a unique name will be used as the file name
-result = sh.download('http://ieeexplore.ieee.org/xpl/login.jsp?tp=&arnumber=1648853', path='paper.pdf')
+# download to disk — if no path given, a unique name is generated
+result = sh.download('10.1038/nature12373', destination='./papers/', path='paper.pdf')
 ```
 
-### search
+#### search
 
-```
+```python
 from scihub import SciHub
 
 sh = SciHub()
 
-# retrieve 5 articles on Google Scholars related to 'bittorrent'
-results = sh.search('bittorrent', 5)
+# search Google Scholar
+results = sh.search('CRISPR gene editing', limit=5)
 
-# download the papers; will use sci-hub.io if it must
+# download each result via Sci-Hub
 for paper in results['papers']:
-	sh.download(paper['url'])
-
+    sh.download(paper['url'], destination='./papers/')
 ```
+
+#### custom mirrors
+
+```python
+from scihub import SciHub
+
+# use specific mirrors instead of built-in defaults
+sh = SciHub(mirrors=['https://sci-hub.ru', 'https://sci-hub.vg'])
+
+result = sh.download('10.1038/nature12373')
+```
+
 License
 -------
 MIT
-
-
-
-
-
-
-
-
-
-
