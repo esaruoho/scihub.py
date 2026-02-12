@@ -2,9 +2,9 @@
 
 """
 Sci-API Unofficial API
-[Search|Download] research papers from [scholar.google.com|sci-hub.io].
+[Search|Download] research papers from [scholar.google.com|sci-hub].
 
-@author zaytoun
+@author zaytoun (original), updated 2026
 """
 
 import re
@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import logging
 import os
+import time
 
 import requests
 import urllib3
@@ -23,112 +24,195 @@ logging.basicConfig()
 logger = logging.getLogger('Sci-Hub')
 logger.setLevel(logging.DEBUG)
 
-#
 urllib3.disable_warnings()
 
 # constants
 SCHOLARS_BASE_URL = 'https://scholar.google.com/scholar'
-HEADERS = {'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:27.0) Gecko/20100101 Firefox/27.0'}
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+                  'AppleWebKit/537.36 (KHTML, like Gecko) '
+                  'Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+}
+
+# Known working Sci-Hub mirrors (updated Feb 2026)
+# Checked in order. Mirrors using sci.bban.top CDN listed first (direct
+# embed/iframe links to PDFs). sci-hub.ru is the "real" Sci-Hub with
+# self-hosted /storage/ paths and <object> tags.
+SCIHUB_MIRRORS = [
+    'https://sci-hub.vg',    # iframe, sci.bban.top CDN
+    'https://sci-hub.al',    # embed, sci.bban.top CDN
+    'https://sci-hub.mk',    # embed, sci.bban.top CDN
+    'https://sci-hub.ru',    # object tag, self-hosted /storage/
+]
+
+# Delay between consecutive downloads (seconds) to avoid CAPTCHA/rate-limiting
+DOWNLOAD_DELAY = 3
+
 
 class SciHub(object):
     """
-    SciHub class can search for papers on Google Scholars 
-    and fetch/download papers from sci-hub.io
+    SciHub class can search for papers on Google Scholars
+    and fetch/download papers from sci-hub mirrors.
     """
 
     def __init__(self):
         self.sess = requests.Session()
         self.sess.headers = HEADERS
-        self.available_base_url_list = self._get_available_scihub_urls()
+        self.available_base_url_list = list(SCIHUB_MIRRORS)
         self.base_url = self.available_base_url_list[0] + '/'
-
-    def _get_available_scihub_urls(self):
-        '''
-        Finds available scihub urls via https://sci-hub.now.sh/
-        '''
-        urls = []
-        res = requests.get('https://sci-hub.now.sh/')
-        s = self._get_soup(res.content)
-        for a in s.find_all('a', href=True):
-            if 'sci-hub.' in a['href']:
-                urls.append(a['href'])
-        return urls
+        self._last_download_time = 0
 
     def set_proxy(self, proxy):
-        '''
-        set proxy for session
-        :param proxy_dict:
-        :return:
-        '''
+        """Set proxy for session."""
         if proxy:
             self.sess.proxies = {
                 "http": proxy,
-                "https": proxy, }
+                "https": proxy,
+            }
+
+    def _reset_mirrors(self):
+        """Reset the mirror list back to full. Called at the start of each download."""
+        self.available_base_url_list = list(SCIHUB_MIRRORS)
+        self.base_url = self.available_base_url_list[0] + '/'
 
     def _change_base_url(self):
         if not self.available_base_url_list:
             raise Exception('Ran out of valid sci-hub urls')
         del self.available_base_url_list[0]
+        if not self.available_base_url_list:
+            raise Exception('Ran out of valid sci-hub urls')
         self.base_url = self.available_base_url_list[0] + '/'
-        logger.info("I'm changing to {}".format(self.available_base_url_list[0]))
+        logger.info("Switching to %s", self.base_url)
+
+    def _rate_limit(self):
+        """Enforce delay between downloads to avoid CAPTCHA."""
+        elapsed = time.time() - self._last_download_time
+        if elapsed < DOWNLOAD_DELAY:
+            time.sleep(DOWNLOAD_DELAY - elapsed)
+        self._last_download_time = time.time()
 
     def search(self, query, limit=10, download=False):
         """
         Performs a query on scholar.google.com, and returns a dictionary
-        of results in the form {'papers': ...}. Unfortunately, as of now,
-        captchas can potentially prevent searches after a certain limit.
+        of results in the form {'papers': [{'name': ..., 'url': ...,
+        'authors': ..., 'pdf': ...}, ...]}.
+
+        Google Scholar requires a session with cookies to avoid CAPTCHA.
         """
         start = 0
         results = {'papers': []}
 
+        # Hit Scholar homepage first to establish cookies
+        try:
+            self.sess.get('https://scholar.google.com/', timeout=15)
+            time.sleep(1)
+        except requests.exceptions.RequestException:
+            pass  # proceed anyway, might still work
+
         while True:
             try:
-                res = self.sess.get(SCHOLARS_BASE_URL, params={'q': query, 'start': start})
+                res = self.sess.get(
+                    SCHOLARS_BASE_URL,
+                    params={'q': query, 'start': start, 'hl': 'en'},
+                    timeout=15
+                )
             except requests.exceptions.RequestException as e:
                 results['err'] = 'Failed to complete search with query %s (connection error)' % query
                 return results
 
+            if res.status_code == 429:
+                results['err'] = 'Failed to complete search with query %s (rate limited, try again later)' % query
+                return results
+
             s = self._get_soup(res.content)
-            papers = s.find_all('div', class_="gs_r")
+
+            # Check for CAPTCHA
+            if 'CAPTCHA' in str(res.content) or 'unusual traffic' in res.text.lower():
+                results['err'] = 'Failed to complete search with query %s (captcha)' % query
+                return results
+
+            # Find result containers. gs_r is the outer wrapper; gs_ri is the
+            # actual result item inside. Filter out non-result gs_r divs
+            # (e.g., the citation dialog) by requiring gs_ri inside.
+            papers = s.find_all('div', class_='gs_r')
 
             if not papers:
-                if 'CAPTCHA' in str(res.content):
-                    results['err'] = 'Failed to complete search with query %s (captcha)' % query
                 return results
 
             for paper in papers:
-                if not paper.find('table'):
-                    source = None
-                    pdf = paper.find('div', class_='gs_ggs gs_fl')
-                    link = paper.find('h3', class_='gs_rt')
+                gs_ri = paper.find('div', class_='gs_ri')
+                if not gs_ri:
+                    continue
 
-                    if pdf:
-                        source = pdf.find('a')['href']
-                    elif link.find('a'):
-                        source = link.find('a')['href']
+                source = None
+                name = None
+                authors = None
+                pdf_url = None
+
+                # Title and URL
+                h3 = gs_ri.find('h3', class_='gs_rt')
+                if h3:
+                    name = h3.text.strip()
+                    a = h3.find('a')
+                    if a:
+                        source = a['href']
                     else:
                         continue
+                else:
+                    continue
 
-                    results['papers'].append({
-                        'name': link.text,
-                        'url': source
-                    })
+                # Author/venue info
+                gs_a = gs_ri.find('div', class_='gs_a')
+                if gs_a:
+                    authors = gs_a.text.strip()
 
-                    if len(results['papers']) >= limit:
-                        return results
+                # Free PDF link (shown on the right side of results)
+                gs_ggs = paper.find('div', class_='gs_ggs')
+                if gs_ggs:
+                    pdf_a = gs_ggs.find('a')
+                    if pdf_a:
+                        pdf_url = pdf_a['href']
+                # Alternative PDF location
+                if not pdf_url:
+                    gs_or = paper.find('div', class_='gs_or_ggsm')
+                    if gs_or:
+                        pdf_a = gs_or.find('a')
+                        if pdf_a:
+                            pdf_url = pdf_a['href']
+
+                entry = {
+                    'name': name,
+                    'url': source,
+                }
+                if authors:
+                    entry['authors'] = authors
+                if pdf_url:
+                    entry['pdf'] = pdf_url
+
+                results['papers'].append(entry)
+
+                if len(results['papers']) >= limit:
+                    return results
 
             start += 10
 
     @retry(wait_random_min=100, wait_random_max=1000, stop_max_attempt_number=10)
     def download(self, identifier, destination='', path=None):
         """
-        Downloads a paper from sci-hub given an indentifier (DOI, PMID, URL).
+        Downloads a paper from sci-hub given an identifier (DOI, PMID, URL).
         Currently, this can potentially be blocked by a captcha if a certain
         limit has been reached.
         """
+        self._rate_limit()
+        # Reset mirror list so a previous paper's failures don't starve this one
+        self._reset_mirrors()
         data = self.fetch(identifier)
 
-        if not 'err' in data:
+        if data and 'err' not in data:
+            if destination:
+                os.makedirs(destination, exist_ok=True)
             self._save(data['pdf'],
                        os.path.join(destination, path if path else data['name']))
 
@@ -137,69 +221,123 @@ class SciHub(object):
     def fetch(self, identifier):
         """
         Fetches the paper by first retrieving the direct link to the pdf.
-        If the indentifier is a DOI, PMID, or URL pay-wall, then use Sci-Hub
+        If the identifier is a DOI, PMID, or URL pay-wall, then use Sci-Hub
         to access and download paper. Otherwise, just download paper directly.
         """
-
         try:
             url = self._get_direct_url(identifier)
+            if not url:
+                self._change_base_url()
+                raise Exception('Could not find PDF URL for identifier %s' % identifier)
 
-            # verify=False is dangerous but sci-hub.io 
-            # requires intermediate certificates to verify
-            # and requests doesn't know how to download them.
-            # as a hacky fix, you can add them to your store
-            # and verifying would work. will fix this later.
-            res = self.sess.get(url, verify=False)
+            res = self.sess.get(url, verify=False, timeout=30)
 
-            if res.headers['Content-Type'] != 'application/pdf':
+            content_type = res.headers.get('Content-Type', '')
+            if 'application/pdf' not in content_type:
                 self._change_base_url()
                 logger.info('Failed to fetch pdf with identifier %s '
-                                           '(resolved url %s) due to captcha' % (identifier, url))
+                            '(resolved url %s) due to captcha' % (identifier, url))
                 raise CaptchaNeedException('Failed to fetch pdf with identifier %s '
                                            '(resolved url %s) due to captcha' % (identifier, url))
-                # return {
-                #     'err': 'Failed to fetch pdf with identifier %s (resolved url %s) due to captcha'
-                #            % (identifier, url)
-                # }
-            else:
-                return {
-                    'pdf': res.content,
-                    'url': url,
-                    'name': self._generate_name(res)
-                }
+
+            # Validate PDF magic bytes
+            if not res.content[:5].startswith(b'%PDF-'):
+                self._change_base_url()
+                raise Exception('Response claimed to be PDF but content is invalid '
+                                'for identifier %s (url %s)' % (identifier, url))
+
+            return {
+                'pdf': res.content,
+                'url': url,
+                'name': self._generate_name(res)
+            }
 
         except requests.exceptions.ConnectionError:
-            logger.info('Cannot access {}, changing url'.format(self.available_base_url_list[0]))
+            logger.info('Cannot access %s, changing url', self.base_url)
             self._change_base_url()
+            # Raise so @retry actually retries instead of returning None
+            raise
 
         except requests.exceptions.RequestException as e:
-            logger.info('Failed to fetch pdf with identifier %s (resolved url %s) due to request exception.'
-                       % (identifier, url))
+            logger.info('Failed to fetch pdf with identifier %s due to request exception: %s',
+                        identifier, str(e))
             return {
-                'err': 'Failed to fetch pdf with identifier %s (resolved url %s) due to request exception.'
-                       % (identifier, url)
+                'err': 'Failed to fetch pdf with identifier %s due to request exception: %s'
+                       % (identifier, str(e))
             }
 
     def _get_direct_url(self, identifier):
-        """
-        Finds the direct source url for a given identifier.
-        """
+        """Finds the direct source url for a given identifier."""
         id_type = self._classify(identifier)
-
         return identifier if id_type == 'url-direct' \
             else self._search_direct_url(identifier)
 
     def _search_direct_url(self, identifier):
         """
-        Sci-Hub embeds papers in an iframe. This function finds the actual
-        source url which looks something like https://moscow.sci-hub.io/.../....pdf.
+        Sci-Hub embeds papers in an iframe, embed, or object tag.
+        This function finds the actual source url to the PDF.
         """
-        res = self.sess.get(self.base_url + identifier, verify=False)
+        res = self.sess.get(self.base_url + identifier, verify=False, timeout=30)
+
+        # Check if sci-hub returned the PDF directly (some mirrors do this)
+        if 'application/pdf' in res.headers.get('Content-Type', ''):
+            return res.url
+
         s = self._get_soup(res.content)
+
+        # Try iframe (classic sci-hub, sci-hub.vg)
         iframe = s.find('iframe')
-        if iframe:
-            return iframe.get('src') if not iframe.get('src').startswith('//') \
-                else 'http:' + iframe.get('src')
+        if iframe and iframe.get('src'):
+            return self._normalize_url(iframe['src'])
+
+        # Try embed (sci-hub.al, sci-hub.mk)
+        embed = s.find('embed', type='application/pdf')
+        if embed and embed.get('src'):
+            return self._normalize_url(embed['src'])
+        # Fallback: any embed with src
+        if not embed:
+            embed = s.find('embed')
+            if embed and embed.get('src'):
+                return self._normalize_url(embed['src'])
+
+        # Try object (sci-hub.ru uses <object data="...">)
+        obj = s.find('object')
+        if obj and obj.get('data'):
+            data_url = obj['data']
+            if '.pdf' in data_url or '/pdf/' in data_url or '/storage/' in data_url:
+                return self._normalize_url(data_url)
+
+        # Try finding a direct download button onclick
+        for btn in s.find_all('button', onclick=True):
+            onclick = btn['onclick']
+            match = re.search(r"location\.href\s*=\s*['\"]([^'\"]+\.pdf[^'\"]*)", onclick)
+            if match:
+                return self._normalize_url(match.group(1).replace('\\/', '/'))
+
+        # Try script tags for PDF URLs
+        for script in s.find_all('script'):
+            txt = script.string or ''
+            urls = re.findall(r'(https?://[^\s"<>\']+\.pdf(?:[^\s"<>\']*)?)', txt)
+            if urls:
+                return urls[0]
+
+        return None
+
+    def _normalize_url(self, url):
+        """Normalize a URL: handle protocol-relative and relative URLs."""
+        url = url.strip()
+        # Remove fragment like #view=FitH or #navpanes=0
+        url = re.sub(r'#.*$', '', url)
+
+        if url.startswith('//'):
+            return 'https:' + url
+        elif url.startswith('/'):
+            # Relative URL — prepend base
+            return self.base_url.rstrip('/') + url
+        elif url.startswith('http'):
+            return url
+        else:
+            return self.base_url.rstrip('/') + '/' + url
 
     def _classify(self, identifier):
         """
@@ -209,7 +347,7 @@ class SciHub(object):
         pmid - PubMed ID
         doi - digital object identifier
         """
-        if (identifier.startswith('http') or identifier.startswith('https')):
+        if identifier.startswith('http') or identifier.startswith('https'):
             if identifier.endswith('pdf'):
                 return 'url-direct'
             else:
@@ -220,90 +358,110 @@ class SciHub(object):
             return 'doi'
 
     def _save(self, data, path):
-        """
-        Save a file give data and a path.
-        """
+        """Save a file given data and a path."""
         with open(path, 'wb') as f:
             f.write(data)
 
     def _get_soup(self, html):
-        """
-        Return html soup.
-        """
+        """Return html soup."""
         return BeautifulSoup(html, 'html.parser')
 
     def _generate_name(self, res):
         """
-        Generate unique filename for paper. Returns a name by calcuating 
-        md5 hash of file contents, then appending the last 20 characters
-        of the url which typically provides a good paper identifier.
+        Generate unique filename for paper. Uses md5 hash of content
+        plus the last part of the URL for readability.
         """
         name = res.url.split('/')[-1]
-        name = re.sub('#view=(.+)', '', name)
-        pdf_hash = hashlib.md5(res.content).hexdigest()
-        return '%s-%s' % (pdf_hash, name[-20:])
+        name = re.sub(r'#.*$', '', name)
+        name = re.sub(r'\?.*$', '', name)
+        if not name.endswith('.pdf'):
+            name += '.pdf'
+        pdf_hash = hashlib.md5(res.content).hexdigest()[:8]
+        return '%s-%s' % (pdf_hash, name[-60:])
+
 
 class CaptchaNeedException(Exception):
     pass
 
-def main():
-    sh = SciHub()
 
-    parser = argparse.ArgumentParser(description='SciHub - To remove all barriers in the way of science.')
-    parser.add_argument('-d', '--download', metavar='(DOI|PMID|URL)', help='tries to find and download the paper',
-                        type=str)
-    parser.add_argument('-f', '--file', metavar='path', help='pass file with list of identifiers and download each',
-                        type=str)
-    parser.add_argument('-s', '--search', metavar='query', help='search Google Scholars', type=str)
+def main():
+    parser = argparse.ArgumentParser(
+        description='SciHub - To remove all barriers in the way of science.')
+    parser.add_argument('-d', '--download', metavar='(DOI|PMID|URL)',
+                        help='tries to find and download the paper', type=str)
+    parser.add_argument('-f', '--file', metavar='path',
+                        help='pass file with list of identifiers and download each', type=str)
+    parser.add_argument('-s', '--search', metavar='query',
+                        help='search Google Scholars', type=str)
     parser.add_argument('-sd', '--search_download', metavar='query',
                         help='search Google Scholars and download if possible', type=str)
-    parser.add_argument('-l', '--limit', metavar='N', help='the number of search results to limit to', default=10,
-                        type=int)
-    parser.add_argument('-o', '--output', metavar='path', help='directory to store papers', default='', type=str)
-    parser.add_argument('-v', '--verbose', help='increase output verbosity', action='store_true')
-    parser.add_argument('-p', '--proxy', help='via proxy format like socks5://user:pass@host:port', action='store', type=str)
+    parser.add_argument('-l', '--limit', metavar='N',
+                        help='the number of search results to limit to', default=10, type=int)
+    parser.add_argument('-o', '--output', metavar='path',
+                        help='directory to store papers', default='', type=str)
+    parser.add_argument('-v', '--verbose',
+                        help='increase output verbosity', action='store_true')
+    parser.add_argument('-p', '--proxy',
+                        help='via proxy format like socks5://user:pass@host:port',
+                        action='store', type=str)
 
     args = parser.parse_args()
 
-    if args.verbose:
-        logger.setLevel(logging.DEBUG)
+    if not args.verbose:
+        logger.setLevel(logging.INFO)
+
+    sh = SciHub()
+
     if args.proxy:
         sh.set_proxy(args.proxy)
 
     if args.download:
         result = sh.download(args.download, args.output)
-        if 'err' in result:
-            logger.debug('%s', result['err'])
+        if not result or 'err' in result:
+            logger.error('Failed: %s', result.get('err', 'Unknown error') if result else 'No result')
         else:
-            logger.debug('Successfully downloaded file with identifier %s', args.download)
+            logger.info('Downloaded: %s', result['name'])
     elif args.search:
         results = sh.search(args.search, args.limit)
         if 'err' in results:
-            logger.debug('%s', results['err'])
+            logger.error('%s', results['err'])
         else:
-            logger.debug('Successfully completed search with query %s', args.search)
-        print(results)
+            logger.info('Found %d results for query "%s"', len(results['papers']), args.search)
+            for i, paper in enumerate(results['papers'], 1):
+                pdf_indicator = ' [PDF]' if 'pdf' in paper else ''
+                print('%d. %s%s' % (i, paper['name'], pdf_indicator))
+                print('   %s' % paper['url'])
+                if 'authors' in paper:
+                    print('   %s' % paper['authors'])
+                print()
     elif args.search_download:
         results = sh.search(args.search_download, args.limit)
         if 'err' in results:
-            logger.debug('%s', results['err'])
+            logger.error('%s', results['err'])
         else:
-            logger.debug('Successfully completed search with query %s', args.search_download)
-            for paper in results['papers']:
+            logger.info('Found %d results, downloading...', len(results['papers']))
+            for i, paper in enumerate(results['papers'], 1):
+                logger.info('[%d/%d] %s', i, len(results['papers']), paper['name'])
                 result = sh.download(paper['url'], args.output)
-                if 'err' in result:
-                    logger.debug('%s', result['err'])
+                if not result or 'err' in result:
+                    logger.error('  Failed: %s',
+                                 result.get('err', 'Unknown error') if result else 'No result')
                 else:
-                    logger.debug('Successfully downloaded file with identifier %s', paper['url'])
+                    logger.info('  Saved: %s', result['name'])
     elif args.file:
         with open(args.file, 'r') as f:
-            identifiers = f.read().splitlines()
-            for identifier in identifiers:
+            identifiers = [line.strip() for line in f if line.strip()]
+            total = len(identifiers)
+            for i, identifier in enumerate(identifiers, 1):
+                logger.info('[%d/%d] Downloading: %s', i, total, identifier)
                 result = sh.download(identifier, args.output)
-                if 'err' in result:
-                    logger.debug('%s', result['err'])
+                if not result or 'err' in result:
+                    logger.error('  Failed: %s',
+                                 result.get('err', 'Unknown error') if result else 'No result')
                 else:
-                    logger.debug('Successfully downloaded file with identifier %s', identifier)
+                    logger.info('  Saved: %s', result['name'])
+    else:
+        parser.print_help()
 
 
 if __name__ == '__main__':

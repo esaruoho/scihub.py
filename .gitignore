@@ -87,6 +87,9 @@ ENV/
 # .DSTORE
 .DS_Store
 
-# IDE 
+# IDE
 .vscode/
 .idea/
+
+# Downloaded papers
+papers/
