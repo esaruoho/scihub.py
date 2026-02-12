@@ -57,10 +57,12 @@ class SciHub(object):
     and fetch/download papers from sci-hub mirrors.
     """
 
-    def __init__(self):
+    def __init__(self, mirrors=None):
         self.sess = requests.Session()
         self.sess.headers = HEADERS
-        self.available_base_url_list = list(SCIHUB_MIRRORS)
+        # User-provided mirrors take priority, then fall back to built-in list
+        self._mirrors = list(mirrors) if mirrors else list(SCIHUB_MIRRORS)
+        self.available_base_url_list = list(self._mirrors)
         self.base_url = self.available_base_url_list[0] + '/'
         self._last_download_time = 0
 
@@ -74,7 +76,7 @@ class SciHub(object):
 
     def _reset_mirrors(self):
         """Reset the mirror list back to full. Called at the start of each download."""
-        self.available_base_url_list = list(SCIHUB_MIRRORS)
+        self.available_base_url_list = list(self._mirrors)
         self.base_url = self.available_base_url_list[0] + '/'
 
     def _change_base_url(self):
@@ -404,13 +406,18 @@ def main():
     parser.add_argument('-p', '--proxy',
                         help='via proxy format like socks5://user:pass@host:port',
                         action='store', type=str)
+    parser.add_argument('-m', '--mirror', metavar='URL',
+                        help='use specific sci-hub mirror URL(s), can be repeated '
+                             '(e.g. -m https://sci-hub.ru -m https://sci-hub.vg)',
+                        action='append', type=str)
 
     args = parser.parse_args()
 
     if not args.verbose:
         logger.setLevel(logging.INFO)
 
-    sh = SciHub()
+    # User-provided mirrors override built-in defaults
+    sh = SciHub(mirrors=args.mirror)
 
     if args.proxy:
         sh.set_proxy(args.proxy)
